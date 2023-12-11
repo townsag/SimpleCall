@@ -7,15 +7,20 @@ from typing import Any, Sequence
 import jax
 import jax.numpy as jnp
 from jax import random
+import numpy as np
 
 import wandb
 
 from src.ctc_objectives import ctc_loss
 from fast_ctc_decode import viterbi_search
+from scripts.evaluation import alignment_accuracy
 
 import chex
 
 sample_input_shape = (64,2000,1)
+NON_RECURRENT_ENCODING_DICT = {'A':1, 'C':2, 'G':3, 'T':4, '':0}
+NON_RECURRENT_DECODING_DICT = {1:'A', 2:'C', 3:'G', 4:'T', 0:''}
+PADDING_NUM = 0
 
 class CNN_feature_extractor(nn.Module):
     # ToDo: initial parameters were initialized via a uniform distribution with values ranging from -0.08 to 0.08
@@ -76,28 +81,8 @@ class CNN_LSTM_CTC(nn.Module):
         # output should be of shape (Batch, Length, alphabet_size=5)
         return x
 
-
-def decode(logits, alphabet, qstring = False, qscale = 1.0, qbias = 1.0, collapse_repeats = True):
-    """
-    inputs:
-        logits:
-            - has shape (Batch, length, features=5)
-        Alphabet:
-            - string of length 5, probably "NACGT"
-    returns: 
-        list of strings:[Batch]
-    """
-    # ToDo: rewite the loopy implementation in a vmapped or pmapped way, this is not very Jax-thonic
-    chex.assert_rank(logits, 3)
-    # process the logits to be predictions
-    predictions = nn.log_softmax(logits, axis=-1)
-    decoded_predictions = []
-    for sample_num in range(predictions.shape[0]):
-        seq, _path = viterbi_search(predictions[sample_num,:,:], alphabet,  qstring = qstring, qscale = qscale, qbias = qbias, collapse_repeats = collapse_repeats)
-        decoded_predictions.append(seq)
-
 @jax.jit
-def train_step(state, samples, ground_truth_labels, labels_padding_mask, alphabet, epoch):
+def train_step(state, samples, ground_truth_labels, labels_padding_mask, batch):
     def loss_fn(params):
         # apply can take both a single input or a vector of inputs
         epsilon = 1e-10
@@ -111,25 +96,61 @@ def train_step(state, samples, ground_truth_labels, labels_padding_mask, alphabe
         mean_batch_loss = jnp.mean(loss)
         return mean_batch_loss, logits
   
-    (_mean_batch_loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)   # gradient descent is performed here
+    (mean_batch_loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)   # gradient descent is performed here
 
     # this abstracts away the optimizer function call and optimizer implementation behind the state class api
     state = state.apply_gradients(grads=grads) # update is performed here
-
-    metrics = compute_metrics(logits=logits, 
-                              ground_truth_labels=ground_truth_labels, 
-                              labels_padding_mask=labels_padding_mask,
-                              alphabet=alphabet)
-    return state, metrics
+    return state, logits, mean_batch_loss
 
 @jax.jit
-def eval_step(state, samples, ground_truth_labels, labels_padding_mask, alphabet):
+def eval_step(state, samples, ground_truth_labels, labels_padding_mask):
     x = jnp.expand_dims(samples, axis=2)
     logits = state.apply_fn({'params': state.params}, x)
-    return compute_metrics(logits=logits, 
-                           ground_truth_labels=ground_truth_labels, 
-                           labels_padding_mask=labels_padding_mask,
-                           alphabet=alphabet)
+    per_seq_loss = ctc_loss(logits=logits,
+                            logitpaddings=jnp.zeros((logits.shape[0], logits.shape[1])),
+                            labels=ground_truth_labels,
+                            labelpaddings=labels_padding_mask,
+                            blank_id=0)
+    mean_batch_loss = jnp.mean(per_seq_loss)
+    return logits, mean_batch_loss
+
+def decode_batch(logits, alphabet, qstring = False, qscale = 1.0, qbias = 1.0, collapse_repeats = True):
+    """
+    inputs:
+        logits:
+            - has shape (Batch, length, features=5)
+        Alphabet:
+            - string of length 5, probably "NACGT"
+    returns: 
+        list of strings:[Batch]
+    """
+    # ToDo: rewite the loopy implementation in a vmapped or pmapped way, this is not very Jax-thonic
+    # this is questionable, I am not sure if jax can vmap over non pure python code
+    chex.assert_rank(logits, 3)
+    # process the logits to be predictions
+    predictions = nn.log_softmax(logits, axis=-1)
+    decoded_predictions = []
+    for sample_num in range(predictions.shape[0]):
+        seq, _path = viterbi_search(np.array(predictions[sample_num,:,:]), alphabet,  qstring = qstring, qscale = qscale, qbias = qbias, collapse_repeats = collapse_repeats)
+        decoded_predictions.append(seq)
+    return decoded_predictions
+
+def accuracy_batch(logits, ground_truth_labels, alphabet):
+    decoded_predictions = decode_batch(logits=logits, alphabet=alphabet)
+    # decode labels
+    ground_truth_labels = ground_truth_labels.astype(str)
+    ground_truth_labels[ground_truth_labels == str(PADDING_NUM)] = ""
+    for key, value in NON_RECURRENT_DECODING_DICT.items():
+        ground_truth_labels[ground_truth_labels == str(key)] = value
+    ground_truth_labels_str_list = ["".join(sample) for sample in ground_truth_labels.tolist()]
+    # compute the accuracy
+    assert len(decoded_predictions) == len(ground_truth_labels_str_list), \
+        f"there should be as many label sequences: {len(ground_truth_labels_str_list)} as there are prediction sequences: {len(decoded_predictions)}"
+    per_sequence_accuracies = list()
+    for label_seq, pred_seq in zip(ground_truth_labels_str_list, decoded_predictions):
+        per_sequence_accuracies.append(alignment_accuracy(label_seq, pred_seq))
+    
+    return jnp.mean(jnp.array(per_sequence_accuracies))
 
 def train_one_epoch(state, train_dataloader, alphabet, epoch):
     """Train for 1 epoch on the training set."""
@@ -140,18 +161,19 @@ def train_one_epoch(state, train_dataloader, alphabet, epoch):
         labels_padding_mask = jnp.zeros_like(labels)
         labels_padding_mask = labels_padding_mask.at[labels == 0].set(1)
         # labels_padding_mask[labels == 0] = 1
-        state, metrics = train_step(state=state, samples=features, ground_truth_labels=labels, 
-                                    labels_padding_mask=labels_padding_mask, alphabet=alphabet, 
-                                    epoch=epoch)
-        batch_metrics.append(metrics)
-        print("epoch: ", epoch, ", batch: ", count)
-        print(metrics)
+        state, batch_logits, mean_batch_loss = train_step(state=state, samples=features, ground_truth_labels=labels, 
+                                    labels_padding_mask=labels_padding_mask, batch=count)
+        mean_batch_accuracy = accuracy_batch(logits=batch_logits, ground_truth_labels=labels, alphabet=alphabet)
 
-    # Aggregate the metrics
-    batch_metrics_np = jax.device_get(batch_metrics)  # pull from the accelerator onto host (CPU)
-    epoch_metrics_np = {
-        k: jnp.mean(jnp.array([metrics[k] for metrics in batch_metrics_np]))
-        for k in batch_metrics_np[0]
+        batch_metrics.append({"loss": mean_batch_loss, "accuracy": mean_batch_accuracy})
+        print("epoch: ", epoch, ", batch: ", count, ", mean_batch_accuracy: ", mean_batch_accuracy, "mean_batch_loss: ", mean_batch_loss)
+        # print(metrics)
+
+    # Aggregate the metrics over the epoch
+    batch_metrics = jax.device_get(batch_metrics)  # pull from the accelerator onto host (CPU)
+    epoch_metrics = {
+        "mean_epoch_loss": jnp.mean(jnp.array([item["loss"] for item in batch_metrics])),
+        "mean_epoch_accuracy": jnp.mean(jnp.array([item["accuracy"] for item in batch_metrics]))
     }
 
     # wandb.log({
@@ -160,7 +182,7 @@ def train_one_epoch(state, train_dataloader, alphabet, epoch):
     #     }, step=epoch)
 
 
-    return state, epoch_metrics_np
+    return state, epoch_metrics
 
 
 def evaluate_model(state, test_dataloader, alphabet):
@@ -173,13 +195,13 @@ def evaluate_model(state, test_dataloader, alphabet):
 
         test_labels_padding_mask = jnp.zeros_like(test_labels)
         test_labels_padding_mask = test_labels_padding_mask.at[test_labels == 0].set(1)
-        # test_labels_padding_mask[test_labels == 0] = 1
-        metrics = eval_step(state=state, samples=test_features, ground_truth_labels=test_labels, 
-                            labels_padding_mask=test_labels_padding_mask, alphabet=alphabet)
-        metrics = jax.device_get(metrics)  # pull from the accelerator onto host (CPU)
-        metrics = jax.tree_map(lambda x: x.item(), metrics)  # np.ndarray -> scalar
-        batch_metrics.append(metrics)
-    print("bnatch metrics element type: ", type(batch_metrics[0]))
+        batch_logits, mean_batch_loss = eval_step(state=state, samples=test_features, ground_truth_labels=test_labels, 
+                            labels_padding_mask=test_labels_padding_mask)
+        mean_batch_accuracy = accuracy_batch(logits=batch_logits, ground_truth_labels=test_labels, alphabet=alphabet)
+        mean_batch_loss = jax.device_get(mean_batch_loss)  # pull from the accelerator onto host (CPU)
+        mean_batch_accuracy = jax.device_get(mean_batch_accuracy)
+        batch_metrics.append({"loss": mean_batch_loss, "accuracy": mean_batch_accuracy})
+    # print("bnatch metrics element type: ", type(batch_metrics[0]))
     # print("shape of elem accuracy: ", batch_metrics[0]["loss"].shape)
     mean_metrics_over_test_set = {}
     mean_metrics_over_test_set["loss"] = jnp.mean(jnp.array([item["loss"] for item in batch_metrics]))
@@ -204,66 +226,19 @@ def create_train_state(key, learning_rate):
     # TrainState is a simple built-in wrapper class that makes things a bit cleaner
     return flax.training.train_state.TrainState.create(apply_fn=model.apply, params=params, tx=adam_opt)
 
-def compute_metrics(*, logits, ground_truth_labels, labels_padding_mask, alphabet):
-    per_sequence_loss = ctc_loss(logits=logits,
-                        logitpaddings=jnp.zeros((logits.shape[0], logits.shape[1])),
-                        labels=ground_truth_labels,
-                        labelpaddings=labels_padding_mask,
-                        blank_id=0)
-    mean_batch_loss = jnp.mean(per_sequence_loss)
-    # ToDo: compute accuracy as well as loss
-    list_decoded_predictions = decode(logits=logits, alphabet=alphabet)
-    metrics = {
-        'loss': mean_batch_loss,
-        'accuracy': 0.5,
-    }
-    return metrics
-
-
-
-
-# class MLP(nn.Module):
-#     num_features: Sequence[int]
-
-#     def setup(self):
-#         self.layers = [nn.Dense(features=num, kernel_init=flax.linen.initializers.glorot_normal()) for num in self.num_features]
-#         # self.layers = [nn.Dense(features=num) for num in self.num_features]
-    
-#     def __call__(self, x):
-#         activation = x
-#         for i, layer in enumerate(self.layers):
-#             activation = layer(activation)
-#             if i != len(self.layers) - 1:
-#                 # activation = nn.relu(activation)
-#                 activation = nn.leaky_relu(activation)
-#         # return nn.sigmoid(activation)
-#         return nn.softmax(activation)
-
-
-# @jax.jit
-# def train_step(state, samples, ground_truth_labels, epoch):
-#     def loss_fn(params):
-#         # apply can take both a single input or a vector of inputs
-#         # predictions = MLP().apply({'params': params}, samples)
-#         epsilon = 1e-10
-#         predictions = jnp.clip(state.apply_fn({'params': params}, samples), a_min=epsilon, a_max=1-epsilon)
-#         loss = -jnp.mean(jnp.sum(nn.one_hot(ground_truth_labels, num_classes=2) * jnp.log(predictions), axis=-1))
-#         return loss, predictions
-  
-#     (_, predictions), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)   # gradient descent is performed here
-
-#     # this abstracts away the optimizer function call and iptimizes implementation behind the state class api
-#     state = state.apply_gradients(grads=grads) # update is performed here
-
-#     metrics = compute_metrics(predictions=predictions, ground_truth_labels=ground_truth_labels)
-#     return state, metrics
-
-# @jax.jit
-# def eval_step(state, samples, ground_truth_labels):
-#     # predictions = MLP().apply({'params': state.params}, samples)
-#     predictions = state.apply_fn({'params': state.params}, samples)
-#     return compute_metrics(predictions=predictions, ground_truth_labels=ground_truth_labels)
-
+# def compute_metrics(*, logits, ground_truth_labels, labels_padding_mask, alphabet):
+#     per_sequence_loss = ctc_loss(logits=logits,
+#                         logitpaddings=jnp.zeros((logits.shape[0], logits.shape[1])),
+#                         labels=ground_truth_labels,
+#                         labelpaddings=labels_padding_mask,
+#                         blank_id=0)
+#     mean_batch_loss = jnp.mean(per_sequence_loss)
+#     list_decoded_predictions = decode_batch(logits=logits, alphabet=alphabet)
+#     metrics = {
+#         'loss': mean_batch_loss,
+#         'accuracy': 0.5,
+#     }
+#     return metrics
 
 # def train_one_epoch(state, dataloader, epoch):
 #     """Train for 1 epoch on the training set."""
@@ -287,76 +262,6 @@ def compute_metrics(*, logits, ground_truth_labels, labels_padding_mask, alphabe
 
 #     return state, epoch_metrics_np
 
-# def evaluate_model(state, test_samples, test_labels):
-#     """Evaluate on the validation set."""
-#     metrics = eval_step(state, test_samples, test_labels)
-#     metrics = jax.device_get(metrics)  # pull from the accelerator onto host (CPU)
-#     metrics = jax.tree_map(lambda x: x.item(), metrics)  # np.ndarray -> scalar
-#     return metrics
-
-
-# def create_train_state(key, num_features, learning_rate, momentum):
-#     mlp = MLP(num_features=num_features)
-#     # params = mlp.init(key, jnp.ones([1, input_feature_size]))['params']
-#     params = mlp.init(key, jnp.ones([input_feature_size]))['params']
-#     # print("========params at initialization==========")
-#     # print(params)
-#     # sgd_opt = optax.sgd(learning_rate, momentum)
-#     adam_opt = optax.adam(learning_rate=learning_rate, b1=0.9, b2=0.999, eps=1e-08, eps_root=0.0, mu_dtype=None)
-#     # adam_opt = optax.adam(learning_rate=learning_rate, b1=0.9, b2=0.999, eps=1e-03, eps_root=0.0, mu_dtype=None)
-#     # adam_cliped_opt = optax.chain(
-#     #     optax.clip(1.0),
-#     #     optax.adam(learning_rate=learning_rate, b1=0.9, b2=0.999, eps=1e-08, eps_root=0.0, mu_dtype=None)
-#     # )
-#     # adagrad_opt = optax.adagrad(learning_rate=learning_rate, initial_accumulator_value=0.1, eps=1e-07)
-#     # lion_opt = optax.lion(learning_rate=learning_rate)
-#     # rms_opt = optax.rmsprop(learning_rate=learning_rate, momentum=momentum)
-#     # TrainState is a simple built-in wrapper class that makes things a bit cleaner
-#     return flax.training.train_state.TrainState.create(apply_fn=mlp.apply, params=params, tx=adam_opt)
-
-# def compute_metrics(*, predictions, ground_truth_labels):
-#     # loss = jnp.mean(-ground_truth_labels*jnp.log(predictions) - (1-ground_truth_labels)*jnp.log(1-predictions))
-#     loss = -jnp.mean(jnp.sum(nn.one_hot(ground_truth_labels, num_classes=2) * jnp.log(predictions), axis=-1))
-#     # accuracy = jnp.mean(jnp.round(predictions) == ground_truth_labels)
-#     accuracy = jnp.mean(jnp.argmax(predictions, axis=-1) == ground_truth_labels)
-
-#     metrics = {
-#         'loss': loss,
-#         'accuracy': accuracy,
-#     }
-#     return metrics
-
-
-# def batch_generator(feature_matrix, label_matrix, batch_size):
-#     assert feature_matrix.shape[0] == label_matrix.shape[0], "feature matrix and label matrix should have the same number of items"
-#     num_samples = feature_matrix.shape[0]
-#     num_batches = num_samples // batch_size
-
-#     for i in range(num_batches):
-#         start = i * batch_size
-#         end = (i + 1) * batch_size
-#         features_batch = feature_matrix[start:end, :]
-#         labels_batch = label_matrix[start:end]
-#         yield features_batch, labels_batch
-
-#     # Yield the remaining samples in a smaller batch if any
-#     if num_samples % batch_size != 0:
-#         start = num_batches * batch_size
-#         features_batch = feature_matrix[start:, :]
-#         labels_batch = label_matrix[start:]
-#         yield features_batch, labels_batch
-
-
-# seed = 0  # needless to say these should be in a config or defined like flags
-# learning_rate = .01
-# momentum = 0.9
-# num_epochs = 30
-# # batch_size = 3578
-# batch_size = 32
-# num_classes = 2
-# # num_features = [100,100,num_classes]
-# num_features = [100,100,100,num_classes]
-
 
 # start a new wandb run to track this script
 # wandb.init(
@@ -376,18 +281,3 @@ def compute_metrics(*, logits, ground_truth_labels, labels_padding_mask, alphabe
 #     "initialization":"XG"
 #     }
 # )
-
-
-# train_state = create_train_state(key=jax.random.PRNGKey(seed), num_features=num_features, learning_rate=learning_rate, momentum=momentum)
-
-# for epoch in range(1, num_epochs + 1):
-#     train_state, train_metrics, flag = train_one_epoch(train_state, batch_generator(train_inputs, train_targets, batch_size), epoch)
-#     if flag:
-#         break
-#     print(f"Train epoch: {epoch}, loss: {train_metrics['loss']}, accuracy: {train_metrics['accuracy'] * 100}")
-
-#     test_metrics = evaluate_model(train_state, test_inputs, test_targets)
-#     print(f"\tTest epoch: {epoch}, loss: {test_metrics['loss']}, accuracy: {test_metrics['accuracy'] * 100}")
-
-
-# wandb.finish()
