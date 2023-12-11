@@ -129,7 +129,9 @@ def decode_batch(logits, alphabet, qstring = False, qscale = 1.0, qbias = 1.0, c
     # this is questionable, I am not sure if jax can vmap over non pure python code
     chex.assert_rank(logits, 3)
     # process the logits to be predictions
-    predictions = nn.log_softmax(logits, axis=-1)
+    epsilon = 1e-10
+    predictions = jnp.log(jnp.clip(nn.softmax(logits, axis=-1), a_min=epsilon, a_max=1-epsilon))
+
     decoded_predictions = []
     for sample_num in range(predictions.shape[0]):
         seq, _path = viterbi_search(np.array(predictions[sample_num,:,:]), alphabet,  qstring = qstring, qscale = qscale, qbias = qbias, collapse_repeats = collapse_repeats)
