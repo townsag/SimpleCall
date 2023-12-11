@@ -85,9 +85,10 @@ class CNN_LSTM_CTC(nn.Module):
 def train_step(state, samples, ground_truth_labels, labels_padding_mask, batch):
     def loss_fn(params):
         # apply can take both a single input or a vector of inputs
-        epsilon = 1e-10
         x = jnp.expand_dims(samples, axis=2)
-        logits = jnp.clip(state.apply_fn({'params': params}, x), a_min=epsilon, a_max=1-epsilon)
+        # epsilon = 1e-10
+        # logits = jnp.clip(state.apply_fn({'params': params}, x), a_min=epsilon, a_max=1-epsilon)
+        logits = state.apply_fn({'params': params}, x)
         loss = ctc_loss(logits=logits,
                         logitpaddings=jnp.zeros((logits.shape[0], logits.shape[1])),
                         labels=ground_truth_labels,
