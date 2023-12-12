@@ -8,7 +8,7 @@ NON_RECURRENT_DECODING_DICT = {1:'A', 2:'C', 3:'G', 4:'T', 0:''}
 BASES = ['A', 'C', 'G', 'T']
 BASES_CTC = 'N' + ''.join(BASES)
 
-data_dir = "/Users/andrewtownsend/Desktop/SJSU/CS271/final_project/SimpleCall/practice_data/training_input"
+data_dir = "/home/atownsend/nanopore_project/SimpleCall/practice_data/training_input"
 batch_size = 64
 s2s = False
 
@@ -36,6 +36,8 @@ dataloader_validation = DataLoader(
     collate_fn=custom_collate,
     num_workers = 1
 )
+print(f"num train batches {len(dataloader_train)}")
+print(f"num test batches{len(dataloader_validation)}")
 
 seed = 0
 learning_rate = 1e-3
