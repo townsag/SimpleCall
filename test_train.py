@@ -21,6 +21,7 @@ dataset = BaseNanoporeDataset(
     seed = 1,
     s2s = s2s,
 )
+print(f"total num samples in dataset: {len(dataset)}")
 
 dataloader_train = DataLoader(
     dataset, 
@@ -44,3 +45,5 @@ learning_rate = 1e-3
 num_epochs = 5
 
 from src.model import create_train_state, train_one_epoch, evaluate_model
+
+train_state = create_train_state(key=jax.random.PRNGKey(seed), learning_rate=learning_rate)
