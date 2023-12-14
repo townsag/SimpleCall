@@ -95,8 +95,17 @@ for epoch in range(1, num_epochs + 1):
     train_state, train_metrics = train_one_epoch(state=train_state, train_dataloader=dataloader_train, 
             alphabet=BASES_CTC, epoch=epoch, batches_per_epoch=cfg.num_batches_per_epoch, checkpoint_dir=checkpoint_dir)
     end = time.time()
-    print(f"========== Total Epoch Time: {end - start} ==========")
+    print(f"========== Total Epoch Train Time: {end - start} ==========")
     print(f"Train epoch: {epoch}, loss: {train_metrics['mean_epoch_loss']}, accuracy: {train_metrics['mean_epoch_accuracy'] * 100}")
+
+
+    start = time.time()
+    print(f"Starting evaluation for epoch: {epoch}")
+    test_metrics = evaluate_model(state=train_state, test_dataloader=dataloader_validation, alphabet=BASES_CTC, epoch=epoch)
+    print(f"\Validation epoch: {epoch}, loss: {test_metrics['loss']}, accuracy: {test_metrics['accuracy'] * 100}")
+    end = time.time()
+    print(f"========== Total Epoch Test Time: {end - start} ==========")
+
     checkpoints.save_checkpoint(ckpt_dir=checkpoint_dir, target=train_state.params, step=train_state.step, keep=3)
 
 wandb.finish()
