@@ -2,6 +2,7 @@ import flax
 import optax
 from flax import linen as nn 
 from flax.training import train_state
+from flax.training import checkpoints
 from typing import Any, Sequence
 
 import jax
@@ -21,6 +22,17 @@ sample_input_shape = (64,2000,1)
 NON_RECURRENT_ENCODING_DICT = {'A':1, 'C':2, 'G':3, 'T':4, '':0}
 NON_RECURRENT_DECODING_DICT = {1:'A', 2:'C', 3:'G', 4:'T', 0:''}
 PADDING_NUM = 0
+
+from ml_collections import config_dict
+initial_dictionary = {
+    'int': 1,
+    'list': [1, 2],
+    'tuple': (1, 2, 3),
+    'set': {1, 2, 3, 4},
+    'dict_tuple_list': {'tuple_list': ([1, 2], 3)}
+}
+cfg = config_dict.ConfigDict(initial_dictionary)
+
 
 class CNN_feature_extractor(nn.Module):
     # ToDo: initial parameters were initialized via a uniform distribution with values ranging from -0.08 to 0.08
@@ -155,7 +167,7 @@ def accuracy_batch(logits, ground_truth_labels, alphabet):
     
     return jnp.mean(jnp.array(per_sequence_accuracies))
 
-def train_one_epoch(state, train_dataloader, alphabet, epoch):
+def train_one_epoch(state, train_dataloader, alphabet, epoch, checkpoint_dir):
     """Train for 1 epoch on the training set."""
     batch_metrics = []
     for count, batch in enumerate(train_dataloader):
@@ -169,6 +181,13 @@ def train_one_epoch(state, train_dataloader, alphabet, epoch):
         mean_batch_accuracy = accuracy_batch(logits=batch_logits, ground_truth_labels=labels, alphabet=alphabet)
 
         batch_metrics.append({"loss": mean_batch_loss, "accuracy": mean_batch_accuracy})
+        if batch % 10 == 0:
+            wandb.log({
+                "Train Loss": batch_metrics['loss'],
+                "Train Accuracy": batch_metrics['accuracy'],
+            }, step=epoch)
+        if batch % 100 == 0:
+            checkpoints.save_checkpoint(ckpt_dir=checkpoint_dir, target=state.params, step=state.step)
         print("epoch: ", epoch, ", batch: ", count, ", mean_batch_accuracy: ", mean_batch_accuracy, "mean_batch_loss: ", mean_batch_loss)
         # print(metrics)
 
@@ -178,12 +197,6 @@ def train_one_epoch(state, train_dataloader, alphabet, epoch):
         "mean_epoch_loss": jnp.mean(jnp.array([item["loss"] for item in batch_metrics])),
         "mean_epoch_accuracy": jnp.mean(jnp.array([item["accuracy"] for item in batch_metrics]))
     }
-
-    # wandb.log({
-    #         "Train Loss": epoch_metrics_np['loss'],
-    #         "Train Accuracy": epoch_metrics_np['accuracy'],
-    #     }, step=epoch)
-
 
     return state, epoch_metrics
 
@@ -211,23 +224,39 @@ def evaluate_model(state, test_dataloader, alphabet):
     mean_metrics_over_test_set["accuracy"] = jnp.mean(jnp.array([item["accuracy"] for item in batch_metrics]))
     return mean_metrics_over_test_set
 
-
-def create_train_state(key, learning_rate):
+def create_train_state(key, config):
     model = CNN_LSTM_CTC()
     params = model.init(key, jnp.ones(sample_input_shape))['params']
     
-    # ToDo: add optimizer with:
+    # Tdone: add optimizer with:
     #   - gradient clipping -2 to 2
     #   - linear learning rate warmup
     #   _ cosine learning rate decay
-    adam_opt = optax.adam(learning_rate=learning_rate, b1=0.9, b2=0.999, eps=1e-08, eps_root=0.0, mu_dtype=None)
-    # adam_cliped_opt = optax.chain(
-    #     optax.clip(1.0),
-    #     optax.adam(learning_rate=learning_rate, b1=0.9, b2=0.999, eps=1e-08, eps_root=0.0, mu_dtype=None)
-    # )
+    # config has config.linear_warmup_steps
+    # config hse config.num_batches_per_epoch
+    # config has config.num_epochs
+    # config has config.base_learning_rate
+
+    def create_learning_rate_fn(config):
+        """Creates learning rate schedule."""
+        warmup_fn = optax.linear_schedule(
+            init_value=0., end_value=config.base_learning_rate, transition_steps=config.linear_warmup_steps)
+        cosine_steps = (config.num_epochs * config.num_batches_per_epoch) - config.linear_warmup_steps
+        cosine_fn = optax.cosine_decay_schedule(init_value=config.base_learning_rate, decay_steps=cosine_steps)
+        schedule_fn = optax.join_schedules(
+            schedules=[warmup_fn, cosine_fn],
+            boundaries=[config.linear_warmup_steps])
+        return schedule_fn
+
+    # adam_opt = optax.adam(learning_rate=create_learning_rate_fn(config), b1=0.9, b2=0.999, 
+    #                       eps=1e-08, eps_root=0.0, mu_dtype=None)
+    adam_cliped_opt = optax.chain(
+        optax.clip(2.0),
+        optax.adam(learning_rate=create_learning_rate_fn(config), b1=0.9, b2=0.999, eps=1e-08, eps_root=0.0, mu_dtype=None)
+    )
 
     # TrainState is a simple built-in wrapper class that makes things a bit cleaner
-    return flax.training.train_state.TrainState.create(apply_fn=model.apply, params=params, tx=adam_opt)
+    return flax.training.train_state.TrainState.create(apply_fn=model.apply, params=params, tx=adam_cliped_opt)
 
 # def compute_metrics(*, logits, ground_truth_labels, labels_padding_mask, alphabet):
 #     per_sequence_loss = ctc_loss(logits=logits,
