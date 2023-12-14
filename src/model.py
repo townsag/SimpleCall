@@ -167,7 +167,7 @@ def accuracy_batch(logits, ground_truth_labels, alphabet):
     
     return jnp.mean(jnp.array(per_sequence_accuracies))
 
-def train_one_epoch(state, train_dataloader, alphabet, epoch, checkpoint_dir):
+def train_one_epoch(state, train_dataloader, alphabet, epoch, batches_per_epoch, checkpoint_dir):
     """Train for 1 epoch on the training set."""
     batch_metrics = []
     for count, batch in enumerate(train_dataloader):
@@ -181,14 +181,15 @@ def train_one_epoch(state, train_dataloader, alphabet, epoch, checkpoint_dir):
         mean_batch_accuracy = accuracy_batch(logits=batch_logits, ground_truth_labels=labels, alphabet=alphabet)
 
         batch_metrics.append({"loss": mean_batch_loss, "accuracy": mean_batch_accuracy})
-        if batch % 10 == 0:
+        if count % 10 == 0:
             wandb.log({
-                "Train Loss": batch_metrics['loss'],
-                "Train Accuracy": batch_metrics['accuracy'],
-            }, step=epoch)
-        if batch % 100 == 0:
-            checkpoints.save_checkpoint(ckpt_dir=checkpoint_dir, target=state.params, step=state.step)
-        print("epoch: ", epoch, ", batch: ", count, ", mean_batch_accuracy: ", mean_batch_accuracy, "mean_batch_loss: ", mean_batch_loss)
+                "Train Loss": mean_batch_loss,
+                "Train Accuracy": mean_batch_accuracy,
+            }, step=count + ((epoch - 1) * batches_per_epoch))
+        #if count % 100 == 0:
+        #    checkpoints.save_checkpoint(ckpt_dir=checkpoint_dir, target=state.params, step=state.step)
+        if count % 10 == 0:
+            print("epoch: ", epoch, ", batch: ", count, ", mean_batch_accuracy: ", mean_batch_accuracy, "mean_batch_loss: ", mean_batch_loss)
         # print(metrics)
 
     # Aggregate the metrics over the epoch
@@ -236,9 +237,11 @@ def create_train_state(key, config):
     # config hse config.num_batches_per_epoch
     # config has config.num_epochs
     # config has config.base_learning_rate
+    # config has config.min_learning_rate
 
+    """
     def create_learning_rate_fn(config):
-        """Creates learning rate schedule."""
+        # Creates learning rate schedule.
         warmup_fn = optax.linear_schedule(
             init_value=0., end_value=config.base_learning_rate, transition_steps=config.linear_warmup_steps)
         cosine_steps = (config.num_epochs * config.num_batches_per_epoch) - config.linear_warmup_steps
@@ -254,9 +257,23 @@ def create_train_state(key, config):
         optax.clip(2.0),
         optax.adam(learning_rate=create_learning_rate_fn(config), b1=0.9, b2=0.999, eps=1e-08, eps_root=0.0, mu_dtype=None)
     )
+    """
+    schedule_fn = optax.warmup_cosine_decay_schedule(
+        init_value=0, 
+        peak_value=config.base_learning_rate,
+        warmup_steps=config.linear_warmup_steps,
+        decay_steps=(config.num_epochs * config.num_batches_per_epoch),
+        end_value=config.min_learning_rate
+    )
+
+    adam_cliped_scheduled = optax.chain(
+        optax.clip(2.0),
+        optax.adam(learning_rate=schedule_fn, b1=0.9, b2=0.999, eps=1e-08, eps_root=0.0, mu_dtype=None)
+    )
+
 
     # TrainState is a simple built-in wrapper class that makes things a bit cleaner
-    return flax.training.train_state.TrainState.create(apply_fn=model.apply, params=params, tx=adam_cliped_opt)
+    return flax.training.train_state.TrainState.create(apply_fn=model.apply, params=params, tx=adam_cliped_scheduled)
 
 # def compute_metrics(*, logits, ground_truth_labels, labels_padding_mask, alphabet):
 #     per_sequence_loss = ctc_loss(logits=logits,
