@@ -203,7 +203,7 @@ def train_one_epoch(state, train_dataloader, alphabet, epoch, batches_per_epoch,
     return state, epoch_metrics
 
 
-def evaluate_model(state, test_dataloader, alphabet):
+def evaluate_model(state, test_dataloader, alphabet, epoch):
     """Evaluate on the validation set."""
     batch_metrics = []
     for num, batch in enumerate(test_dataloader):
@@ -219,11 +219,17 @@ def evaluate_model(state, test_dataloader, alphabet):
         mean_batch_loss = jax.device_get(mean_batch_loss)  # pull from the accelerator onto host (CPU)
         mean_batch_accuracy = jax.device_get(mean_batch_accuracy)
         batch_metrics.append({"loss": mean_batch_loss, "accuracy": mean_batch_accuracy})
+        print("epoch: ", epoch, ", batch: ", num, ", mean_batch_valid_accuracy: ", mean_batch_accuracy, "mean_batch_valid_loss: ", mean_batch_loss)
+
     # print("bnatch metrics element type: ", type(batch_metrics[0]))
     # print("shape of elem accuracy: ", batch_metrics[0]["loss"].shape)
     mean_metrics_over_test_set = {}
     mean_metrics_over_test_set["loss"] = jnp.mean(jnp.array([item["loss"] for item in batch_metrics]))
     mean_metrics_over_test_set["accuracy"] = jnp.mean(jnp.array([item["accuracy"] for item in batch_metrics]))
+    wandb.log({
+            "Validation Loss": mean_metrics_over_test_set["loss"],
+            "Validation Accuracy": mean_metrics_over_test_set["accuracy"],
+        }, step=epoch)
     return mean_metrics_over_test_set
 
 def create_train_state(key, config):
