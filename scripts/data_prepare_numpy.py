@@ -7,8 +7,8 @@ ready to be used for dataloading for training a model.
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
-from scripts.read import read_fast5
-from scripts.normalization import normalize_signal_wrapper
+from read import read_fast5
+from normalization import normalize_signal_wrapper
 DATA_PREPARE_READ_SHUFFLE = 1
 
 import numpy as np
@@ -74,7 +74,7 @@ def segment_read(read_file, window_length, overlap, min_bases, max_bases):
 
         # segment start and end points
         break_points = regular_break_points(len(read_data['Dacs']), window_length, overlap = overlap, align = 'left')
-        print("break points: ", break_points)
+        # print("break points: ", break_points)
 
         # normalize the data
         sample = normalize_signal_wrapper(read_data['Dacs'], read_data['offset'], read_data['range'], read_data['digitisation'], 
