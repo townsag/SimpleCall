@@ -185,7 +185,8 @@ def train_one_epoch(state, train_dataloader, alphabet, epoch, batches_per_epoch,
             wandb.log({
                 "Train Loss": mean_batch_loss,
                 "Train Accuracy": mean_batch_accuracy,
-            }, step=count + ((epoch - 1) * batches_per_epoch))
+            }, step=state.step)
+            # step=count + ((epoch -1) * batches_per_epoch)
         #if count % 100 == 0:
         #    checkpoints.save_checkpoint(ckpt_dir=checkpoint_dir, target=state.params, step=state.step)
         if count % 10 == 0:
