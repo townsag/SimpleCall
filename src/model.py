@@ -181,12 +181,12 @@ def train_one_epoch(state, train_dataloader, alphabet, epoch, batches_per_epoch,
         mean_batch_accuracy = accuracy_batch(logits=batch_logits, ground_truth_labels=labels, alphabet=alphabet)
 
         batch_metrics.append({"loss": mean_batch_loss, "accuracy": mean_batch_accuracy})
-        if count % 10 == 0:
-            wandb.log({
-                "Train Loss": mean_batch_loss,
-                "Train Accuracy": mean_batch_accuracy,
-            }, step=state.step)
-            # step=count + ((epoch -1) * batches_per_epoch)
+        # if count % 10 == 0:
+            # wandb.log({
+            #     "Train Loss": mean_batch_loss,
+            #     "Train Accuracy": mean_batch_accuracy,
+            # }, step=state.step)
+        
         #if count % 100 == 0:
         #    checkpoints.save_checkpoint(ckpt_dir=checkpoint_dir, target=state.params, step=state.step)
         if count % 10 == 0:
@@ -226,15 +226,17 @@ def evaluate_model(state, test_dataloader, alphabet, epoch):
     mean_metrics_over_test_set = {}
     mean_metrics_over_test_set["loss"] = jnp.mean(jnp.array([item["loss"] for item in batch_metrics]))
     mean_metrics_over_test_set["accuracy"] = jnp.mean(jnp.array([item["accuracy"] for item in batch_metrics]))
-    wandb.log({
-            "Validation Loss": mean_metrics_over_test_set["loss"],
-            "Validation Accuracy": mean_metrics_over_test_set["accuracy"],
-        }, step=epoch)
+    # wandb.log({
+    #         "Validation Loss": mean_metrics_over_test_set["loss"],
+    #         "Validation Accuracy": mean_metrics_over_test_set["accuracy"],
+    #     }, step=state.step)
     return mean_metrics_over_test_set
 
-def create_train_state(key, config):
+def create_train_state(key, config, params = None):
     model = CNN_LSTM_CTC()
-    params = model.init(key, jnp.ones(sample_input_shape))['params']
+
+    if not params:
+        params = model.init(key, jnp.ones(sample_input_shape))['params']
     
     # Tdone: add optimizer with:
     #   - gradient clipping -2 to 2
@@ -281,59 +283,3 @@ def create_train_state(key, config):
 
     # TrainState is a simple built-in wrapper class that makes things a bit cleaner
     return flax.training.train_state.TrainState.create(apply_fn=model.apply, params=params, tx=adam_cliped_scheduled)
-
-# def compute_metrics(*, logits, ground_truth_labels, labels_padding_mask, alphabet):
-#     per_sequence_loss = ctc_loss(logits=logits,
-#                         logitpaddings=jnp.zeros((logits.shape[0], logits.shape[1])),
-#                         labels=ground_truth_labels,
-#                         labelpaddings=labels_padding_mask,
-#                         blank_id=0)
-#     mean_batch_loss = jnp.mean(per_sequence_loss)
-#     list_decoded_predictions = decode_batch(logits=logits, alphabet=alphabet)
-#     metrics = {
-#         'loss': mean_batch_loss,
-#         'accuracy': 0.5,
-#     }
-#     return metrics
-
-# def train_one_epoch(state, dataloader, epoch):
-#     """Train for 1 epoch on the training set."""
-#     batch_metrics = []
-#     for count, (features, labels) in enumerate(dataloader):
-#         state, metrics = train_step(state, features, labels, epoch)
-#         batch_metrics.append(metrics)
-
-#     # Aggregate the metrics
-#     batch_metrics_np = jax.device_get(batch_metrics)  # pull from the accelerator onto host (CPU)
-#     epoch_metrics_np = {
-#         k: jnp.mean(jnp.array([metrics[k] for metrics in batch_metrics_np]))
-#         for k in batch_metrics_np[0]
-#     }
-
-#     wandb.log({
-#             "Train Loss": epoch_metrics_np['loss'],
-#             "Train Accuracy": epoch_metrics_np['accuracy'],
-#         }, step=epoch)
-
-
-#     return state, epoch_metrics_np
-
-
-# start a new wandb run to track this script
-# wandb.init(
-#     # set the wandb project where this run will be logged
-#     project="CS271_Midterm_202301101",
-    
-#     # track hyperparameters and run metadata
-#     config={
-#     "learning_rate": learning_rate,
-#     "architecture": "MLP",
-#     "dataset": "Buisness usecase",
-#     "batch_size": batch_size,
-#     "epochs": num_epochs,
-#     "num_features": num_features,
-#     "optimizer": "adam",
-#     "activation":"leaky_relu",
-#     "initialization":"XG"
-#     }
-# )
